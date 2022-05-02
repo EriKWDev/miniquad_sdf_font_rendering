@@ -6,8 +6,9 @@ use fontdue::{
 };
 use glam::vec2;
 use miniquad::{
-    conf::Conf, Bindings, Buffer, BufferLayout, BufferType, Context, EventHandler, FilterMode,
-    Pipeline, Shader, TextureFormat, TextureWrap, UserData, VertexAttribute, VertexFormat,
+    conf::Conf, Bindings, BlendState, Buffer, BufferLayout, BufferType, Context, EventHandler,
+    FilterMode, Pipeline, PipelineParams, Shader, Texture, TextureFormat, TextureParams,
+    TextureWrap, UserData, VertexAttribute, VertexFormat,
 };
 
 use crate::shader::Vertex;
@@ -20,6 +21,7 @@ mod shader {
     pub struct Vertex {
         pub pos: glam::Vec2,
         pub uv0: glam::Vec2,
+        pub color: glam::Vec4,
     }
 
     pub const VERTEX: &str = "
@@ -28,16 +30,19 @@ mod shader {
     // Attributes
     in vec2 pos;
     in vec2 uv0;
+    in vec4 color;
 
     // Uniforms
     uniform mat4 mvp;
 
     // Outputs
     out vec2 uv;
+    out vec4 fragment_color;
 
     void main() {
         gl_Position = mvp * vec4(pos, 1.0, 1.0);
         uv = uv0;
+        fragment_color = color;
     }
     ";
 
@@ -46,17 +51,21 @@ mod shader {
 
     // Attributes
     in vec2 uv;
+    in vec4 fragment_color;
 
     // Uniforms
     uniform sampler2D texture_atlas;
 
     // Outputs
-    out vec4 frag_color;
+    out vec4 output_color;
+
+
+    #define ALPHA_THRESH 0.1
 
     void main() {
         vec4 sample = texture(texture_atlas, uv);
-        frag_color = sample;
-        frag_color = vec4(1.0) * vec4(uv, 1.0, 1.0);
+        output_color = sample * fragment_color;
+        output_color.a = output_color.r > ALPHA_THRESH ? output_color.a : 0.0;
     }
     ";
 
@@ -76,53 +85,50 @@ mod shader {
 }
 
 struct Editor {
-    bindings: Bindings,
+    character_bindings: Vec<(Bindings, i32)>,
+    shader: Shader,
     pipeline: Pipeline,
 
     fonts: [Font; 1],
     font_settings: FontSettings,
-    layout: Layout,
-    glyph_cache: HashMap<GlyphRasterConfig, (Metrics, Vec<u8>)>,
-    num_elements: i32,
+    layout: Layout<glam::Vec4>,
+    glyph_cache: HashMap<GlyphRasterConfig, (Metrics, Texture)>,
 
     needs_redraw: bool,
     text_changed: bool,
     n: f32,
-    mouse_x: f32,
-    mouse_y: f32,
 
-    scroll_x: f32,
-    scroll_y: f32,
+    mouse: glam::Vec2,
+    scroll: glam::Vec2,
+    prev_scroll: glam::Vec2,
 }
 
 const TEXT: &str = include_str!("../assets/example.txt");
+const TEXT_PX_SIZE: f32 = 22.0;
+const FONT_BYTES: &[u8] =
+    include_bytes!("../assets/Source_Code_Pro/static/SourceCodePro-Regular.ttf");
+// const FONT_BYTES: &[u8] = include_bytes!("../assets/Roboto_Mono/RobotoMono-VariableFont_wght.ttf");
 
 impl Editor {
     pub fn from_context(ctx: &mut Context) -> Self {
-        let font = include_bytes!("../assets/Source_Code_Pro/SourceCodePro-VariableFont_wght.ttf")
-            as &[u8];
-
         let font_settings = FontSettings {
             scale: 20.0,
             ..FontSettings::default()
         };
 
-        let font = Font::from_bytes(font, font_settings).unwrap();
+        let font = Font::from_bytes(FONT_BYTES, font_settings).unwrap();
         let fonts = [font];
         let layout = Layout::new(CoordinateSystem::PositiveYUp);
 
-        let bindings = Bindings {
-            vertex_buffers: vec![],
-            index_buffer: Buffer::immutable(ctx, BufferType::IndexBuffer, &[0]),
-            images: vec![],
-        };
-
         let shader = Shader::new(ctx, shader::VERTEX, shader::FRAGMENT, shader::meta()).unwrap();
         let pipeline = Pipeline::new(ctx, &[], &[], shader);
+        ctx.set_window_size(100, 100);
 
         Self {
-            bindings,
+            shader,
             pipeline,
+
+            character_bindings: vec![],
 
             fonts,
             font_settings,
@@ -134,13 +140,9 @@ impl Editor {
 
             n: 0.0,
 
-            mouse_x: 0.0,
-            mouse_y: 0.0,
-
-            scroll_x: 0.0,
-            scroll_y: 0.0,
-
-            num_elements: 0,
+            mouse: glam::Vec2::ZERO,
+            scroll: glam::Vec2::ZERO,
+            prev_scroll: glam::Vec2::ZERO,
         }
     }
 
@@ -151,93 +153,119 @@ impl Editor {
             ..LayoutSettings::default()
         });
 
-        self.layout
-            .append(&self.fonts, &TextStyle::new(TEXT, 35.0, 0));
+        for (n, line) in TEXT.lines().enumerate() {
+            self.layout.append(
+                &self.fonts,
+                &TextStyle::with_user_data(
+                    &format!("{:>5}   ", n + 1)[..],
+                    TEXT_PX_SIZE,
+                    0,
+                    glam::vec4(1.0, 1.0, 1.0, 0.4),
+                ),
+            );
 
-        let mut images_in_total_image: HashMap<GlyphRasterConfig, (Metrics, Vec<u8>)> =
+            self.layout.append(
+                &self.fonts,
+                &TextStyle::with_user_data(line, TEXT_PX_SIZE, 0, glam::vec4(1.0, 1.0, 1.0, 1.0)),
+            );
+
+            self.layout.append(
+                &self.fonts,
+                &TextStyle::with_user_data("\n", TEXT_PX_SIZE, 0, glam::vec4(1.0, 1.0, 1.0, 1.0)),
+            );
+        }
+
+        let mut characters: HashMap<GlyphRasterConfig, (Texture, Vec<Vertex>, Vec<u16>)> =
             HashMap::new();
-
-        let num_glyps = self.layout.glyphs().len();
-
-        let mut verticies = Vec::<shader::Vertex>::with_capacity(num_glyps * 4); // 4 verticies per quad
-        let mut indicies = Vec::<u32>::with_capacity(num_glyps * 6); // 3 indicies per triangle
-
-        let (mut largest_glyph_width, mut largest_glyph_height) = (0, 0);
 
         for glyph in self.layout.glyphs() {
             let key = glyph.key;
 
-            let (metrics, bitmap) = self.glyph_cache.entry(key).or_insert_with(|| {
-                self.fonts[glyph.font_index].rasterize_indexed_subpixel(glyph.key.glyph_index, 35.0)
+            let (_metrics, texture) = self.glyph_cache.entry(key).or_insert_with(|| {
+                let (metrics, bitmap) = self.fonts[glyph.font_index]
+                    .rasterize_indexed_subpixel(glyph.key.glyph_index, TEXT_PX_SIZE);
+
+                let texture = Texture::new(
+                    ctx,
+                    miniquad::TextureAccess::Static,
+                    Some(&bitmap),
+                    TextureParams {
+                        format: TextureFormat::RGB8,
+                        wrap: TextureWrap::Clamp,
+                        filter: FilterMode::Linear,
+                        width: metrics.width as u32,
+                        height: metrics.height as u32,
+                    },
+                );
+
+                (metrics, texture)
             });
 
-            images_in_total_image
-                .entry(key)
-                .or_insert((*metrics, bitmap.to_vec()));
-
-            largest_glyph_width = usize::max(largest_glyph_width, metrics.width);
-            largest_glyph_height = usize::max(largest_glyph_height, metrics.height);
+            let (_the_texture, character_verticies, character_indicies) =
+                characters.entry(key).or_insert((*texture, vec![], vec![]));
 
             let (x, y) = (glyph.x, glyph.y);
             let (w, h) = (glyph.width as f32, glyph.height as f32);
 
+            let i = character_verticies.len() as u16;
+
             #[rustfmt::skip]
-            verticies.append(&mut vec![
-                Vertex { pos: glam::vec2(x + 0.0, y + 0.0), uv0: vec2(0.0, 1.0) },
-                Vertex { pos: glam::vec2(x + 0.0, y + h  ), uv0: vec2(0.0, 0.0) },
-                Vertex { pos: glam::vec2(x + w,   y + h  ), uv0: vec2(1.0, 0.0) },
-                Vertex { pos: glam::vec2(x + w,   y + 0.0), uv0: vec2(1.0, 1.0) }
+            character_verticies.append(&mut vec![
+                Vertex { pos: glam::vec2((x + 0.0) * 0.82, (y + 0.0) * 0.82), uv0: vec2(0.0, 1.0), color: glyph.user_data },
+                Vertex { pos: glam::vec2((x + 0.0) * 0.82, (y + h  ) * 0.82), uv0: vec2(0.0, 0.0), color: glyph.user_data },
+                Vertex { pos: glam::vec2((x + w  ) * 0.82, (y + h  ) * 0.82), uv0: vec2(1.0, 0.0), color: glyph.user_data },
+                Vertex { pos: glam::vec2((x + w  ) * 0.82, (y + 0.0) * 0.82), uv0: vec2(1.0, 1.0), color: glyph.user_data },
             ]);
 
-            let i = verticies.len() as u32;
-
-            #[rustfmt::skip]
             #[allow(clippy::identity_op)]
-            indicies.append(&mut vec![
-                i + 0, i + 1, i + 2,
-                i + 0, i + 3, i + 2,
-            ]);
+            character_indicies.append(&mut vec![i + 0, i + 1, i + 2, i + 0, i + 3, i + 2]);
         }
 
-        let image_bytes =
-            vec![
-                1_u8;
-                images_in_total_image.len() * largest_glyph_width * largest_glyph_height * 3
-            ];
-
-        self.num_elements = indicies.len() as i32;
-
-        let shader = Shader::new(ctx, shader::VERTEX, shader::FRAGMENT, shader::meta()).unwrap();
-        self.pipeline = Pipeline::new(
+        self.pipeline = Pipeline::with_params(
             ctx,
             &[BufferLayout::default()],
             &[
                 VertexAttribute::new("pos", VertexFormat::Float2),
                 VertexAttribute::new("uv0", VertexFormat::Float2),
+                VertexAttribute::new("color", VertexFormat::Float4),
             ],
-            shader,
+            self.shader,
+            PipelineParams {
+                alpha_blend: Some(BlendState::new(
+                    miniquad::Equation::Add,
+                    miniquad::BlendFactor::Value(miniquad::BlendValue::SourceAlpha),
+                    miniquad::BlendFactor::OneMinusValue(miniquad::BlendValue::SourceAlpha),
+                )),
+                color_blend: Some(BlendState::new(
+                    miniquad::Equation::Add,
+                    miniquad::BlendFactor::Value(miniquad::BlendValue::SourceAlpha),
+                    miniquad::BlendFactor::One,
+                )),
+                ..Default::default()
+            },
         );
 
-        self.bindings = Bindings {
-            vertex_buffers: vec![Buffer::immutable(
-                ctx,
-                BufferType::VertexBuffer,
-                &verticies[..],
-            )],
-            index_buffer: Buffer::immutable(ctx, BufferType::IndexBuffer, &indicies[..]),
-            images: vec![miniquad::Texture::new(
-                ctx,
-                miniquad::TextureAccess::Static,
-                Some(&image_bytes[..]),
-                miniquad::TextureParams {
-                    format: TextureFormat::RGB8,
-                    wrap: TextureWrap::Repeat, // TODO: Change to clamp after debug
-                    filter: FilterMode::Linear,
-                    width: largest_glyph_width as u32,
-                    height: largest_glyph_height as u32 * images_in_total_image.len() as u32,
-                },
-            )],
-        };
+        self.character_bindings = characters
+            .into_iter()
+            .map(|(_k, (texture, verticies, indicies))| {
+                (
+                    Bindings {
+                        vertex_buffers: vec![Buffer::immutable(
+                            ctx,
+                            BufferType::VertexBuffer,
+                            &verticies[..],
+                        )],
+                        index_buffer: Buffer::immutable(
+                            ctx,
+                            BufferType::IndexBuffer,
+                            &indicies[..],
+                        ),
+                        images: vec![texture],
+                    },
+                    indicies.len() as i32,
+                )
+            })
+            .collect::<Vec<(Bindings, i32)>>();
     }
 
     pub fn render(&mut self, ctx: &mut miniquad::Context) {
@@ -250,54 +278,64 @@ impl Editor {
             glam::Mat4::orthographic_rh_gl(-w / 2.0, w / 2.0, -h / 2.0, h / 2.0, 0.01, 560.0);
 
         let model = glam::Mat4::from_scale_rotation_translation(
-            glam::vec3(0.6, 0.6, 0.6),
+            glam::vec3(1.0, 1.0, 1.0),
             glam::Quat::IDENTITY,
             glam::vec3(0.0, 0.0, 0.0),
         );
         let view = glam::Mat4::look_at_rh(
-            glam::vec3(self.scroll_x + w / 2.0, -self.scroll_y - h / 2.0, 10.0),
-            glam::vec3(self.scroll_x + w / 2.0, -self.scroll_y - h / 2.0, 0.0),
+            glam::vec3(
+                self.prev_scroll.x + w / 2.0,
+                -self.prev_scroll.y - h / 2.0,
+                10.0,
+            ),
+            glam::vec3(
+                self.prev_scroll.x + w / 2.0,
+                -self.prev_scroll.y - h / 2.0,
+                0.0,
+            ),
             glam::vec3(0.0, 1.0, 0.0),
         );
         let mvp = projection * view * model;
-
-        let view2 = glam::Mat4::look_at_rh(
-            glam::vec3(0.0, 0.0, 10.0),
-            glam::vec3(0.0, 0.0, 0.0),
-            glam::vec3(0.0, 1.0, 0.0),
-        );
-        let model2 = glam::Mat4::from_scale_rotation_translation(
-            glam::vec3(0.1, 0.1, 0.1),
-            glam::Quat::IDENTITY,
-            glam::vec3(w / 2.0 - 200.0, h / 2.0, 0.0),
-        );
-        let mvp2 = projection * view2 * model2;
 
         if self.text_changed {
             self.update_text(ctx);
             self.text_changed = false;
         }
 
-        ctx.begin_default_pass(miniquad::PassAction::clear_color(
-            t * t2,
-            1.0 - t,
-            t * t * t,
-            1.0,
-        ));
+        let (r, g, b, a) = (15.0 / 255.0, 15.0 / 255.0, 15.0 / 255.0, 1.0);
+        ctx.begin_default_pass(miniquad::PassAction::clear_color(r, g, b, a));
+
+        /*
+            ctx.begin_default_pass(miniquad::PassAction::clear_color(
+                t * t2 * 0.3,
+                (1.0 - t) * 0.3,
+                t * t * t * 0.3,
+                1.0,
+            ));
+        */
 
         ctx.apply_pipeline(&self.pipeline);
-        ctx.apply_bindings(&self.bindings);
-        ctx.apply_uniforms(&shader::Uniforms { mvp });
-        ctx.draw(0, self.num_elements, 1);
 
-        ctx.apply_uniforms(&shader::Uniforms { mvp: mvp2 });
-        ctx.draw(0, self.num_elements, 1);
+        ctx.apply_uniforms(&shader::Uniforms { mvp });
+
+        for (binding, num_elements) in &self.character_bindings {
+            ctx.apply_bindings(binding);
+            ctx.draw(0, *num_elements, 1);
+        }
+
         ctx.end_render_pass();
     }
 }
 
 impl EventHandler for Editor {
-    fn update(&mut self, _ctx: &mut miniquad::Context) {}
+    fn update(&mut self, _ctx: &mut miniquad::Context) {
+        let dt = 0.2;
+        self.prev_scroll = (1.0 - dt) * self.prev_scroll + self.scroll * dt;
+
+        if self.prev_scroll != self.scroll {
+            self.needs_redraw = true;
+        }
+    }
 
     fn draw(&mut self, ctx: &mut miniquad::Context) {
         if self.needs_redraw {
@@ -311,22 +349,23 @@ impl EventHandler for Editor {
     }
 
     fn mouse_motion_event(&mut self, _ctx: &mut Context, x: f32, y: f32) {
-        if self.mouse_x != x || self.mouse_y != y {
+        if self.mouse.x != x || self.mouse.y != y {
             self.needs_redraw = true;
         }
 
-        self.mouse_x = x;
-        self.mouse_y = y;
+        self.mouse = glam::vec2(x, y);
     }
 
     fn mouse_wheel_event(&mut self, _ctx: &mut Context, dx: f32, dy: f32) {
-        self.scroll_x -= dx * 4.0;
-        self.scroll_y -= dy * 4.0;
+        let old_scroll = self.scroll;
+        self.scroll -= glam::vec2(dx, dy) * 15.0;
 
-        self.scroll_x = f32::max(0.0, self.scroll_x);
-        self.scroll_y = f32::max(0.0, self.scroll_y);
+        self.scroll.x = f32::max(0.0, self.scroll.x);
+        self.scroll.y = f32::min(f32::max(0.0, self.scroll.y), self.layout.height());
 
-        self.needs_redraw = true;
+        if self.scroll != old_scroll {
+            self.needs_redraw = true;
+        }
     }
 
     fn key_down_event(
@@ -342,7 +381,13 @@ impl EventHandler for Editor {
 }
 
 fn main() {
-    miniquad::start(Conf::default(), |mut ctx| {
-        UserData::owning(Editor::from_context(&mut ctx), ctx)
-    });
+    miniquad::start(
+        Conf {
+            window_title: "Erik's Editor".to_owned(),
+            high_dpi: true,
+            sample_count: 8,
+            ..Default::default()
+        },
+        |mut ctx| UserData::owning(Editor::from_context(&mut ctx), ctx),
+    );
 }
