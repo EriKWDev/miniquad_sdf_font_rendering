@@ -10,3 +10,4 @@ debug = true
 fontdue = "0.7.2"
 miniquad = { git = "https://github.com/not-fl3/miniquad", branch = "master" }
 glam = "0.20.5"
+sdf_glyph_renderer = "0.2.0"
