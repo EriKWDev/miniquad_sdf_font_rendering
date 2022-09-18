@@ -8,7 +8,7 @@ use glam::vec2;
 use miniquad::{
     conf::Conf, Bindings, BlendState, Buffer, BufferLayout, BufferType, Context, EventHandler,
     FilterMode, KeyCode, KeyMods, Pipeline, PipelineParams, Shader, Texture, TextureFormat,
-    TextureParams, TextureWrap, UserData, VertexAttribute, VertexFormat,
+    TextureParams, TextureWrap, VertexAttribute, VertexFormat,
 };
 
 use crate::shader::Vertex;
@@ -453,6 +453,6 @@ fn main() {
             sample_count: 8,
             ..Default::default()
         },
-        |mut ctx| UserData::owning(Editor::from_context(&mut ctx), ctx),
+        |mut ctx| Box::new(Editor::from_context(&mut ctx)),
     );
 }

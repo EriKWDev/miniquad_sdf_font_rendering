@@ -8,6 +8,6 @@ debug = true
 
 [dependencies]
 fontdue = "0.7.2"
-miniquad = { git = "https://github.com/not-fl3/miniquad", branch = "master" }
-glam = "0.20.5"
-sdf_glyph_renderer = "0.2.0"
+miniquad = "0.3.13"
+glam = "0.21.3"
+sdf_glyph_renderer = "0.4.0"
